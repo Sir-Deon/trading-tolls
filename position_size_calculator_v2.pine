@@ -1,0 +1,193 @@
+//@version=5
+indicator("🥇 Multi-Account Position Size Calculator (XAUUSD / BTC)", overlay=true, max_lines_count=500, max_labels_count=500, max_polylines_count=50)
+
+// XAUUSD: 1 standard lot = 100 oz. $1 price move = $100 P&L per 1 lot (100 oz × $1).
+// BTCUSD: 1 standard lot = 1 BTC (most brokers). $1 price move = $1 P&L per 1 lot (1 BTC × $1).
+// Formula: Risk $ = |Entry − SL| × (units per lot) × lotSize  →  lotSize = Risk $ ÷ (|Entry−SL| × units per lot)
+// Each registered account has its own balance and risk %, but shares the same Entry/SL/TP.
+
+// ===== INPUTS =====
+grpLevels = "Entry / SL / TP"
+entryPrice = input.price(4000.0, "Entry Price", group=grpLevels, tooltip="Drag this line directly on the chart, or type a price here. Direction (long/short) is set automatically from Entry vs SL. Default is just a starting point — drag it to the current price after adding the indicator.")
+stopLoss = input.price(3990.0, "Stop Loss", group=grpLevels, tooltip="Drag this line directly on the chart, or type a price here. Long: SL below entry. Short: SL above entry.")
+showTP = input.bool(true, "Show Take Profit", group=grpLevels, tooltip="Toggle the TP line/label on or off.")
+takeProfit = input.price(4020.0, "Take Profit", group=grpLevels, tooltip="Drag this line directly on the chart, or type a price here.")
+
+grpInstrument = "Instrument"
+autoDetectInstrument = input.bool(true, "Auto-detect from chart symbol", group=grpInstrument, tooltip="Reads the chart's symbol to pick XAUUSD or BTCUSD automatically. Turn off to choose manually.")
+instrumentManual = input.string("XAUUSD", "Instrument (manual)", options=["XAUUSD", "BTCUSD"], group=grpInstrument, tooltip="Used only when auto-detect is off, or when the chart symbol isn't recognized.")
+useCustomContract = input.bool(false, "Custom contract size", group=grpInstrument, tooltip="Enable to override the default contract size below (e.g. your broker uses different lot specs).")
+customUnitsPerLot = input.float(100.0, "Custom units per lot", minval=0.0001, step=1.0, group=grpInstrument, tooltip="Only used when 'Custom contract size' is enabled.")
+
+// Detect instrument from the chart's symbol (ticker/basecurrency), e.g. OANDA:XAUUSD, COINBASE:BTCUSD, BTCUSDT.
+tickerUpper = str.upper(syminfo.ticker)
+baseUpper = str.upper(syminfo.basecurrency)
+detectedIsBTC = str.contains(tickerUpper, "BTC") or baseUpper == "BTC"
+detectedIsXAU = str.contains(tickerUpper, "XAU") or str.contains(tickerUpper, "GOLD") or baseUpper == "XAU"
+detectedInstrument = detectedIsBTC ? "BTCUSD" : detectedIsXAU ? "XAUUSD" : instrumentManual
+instrument = autoDetectInstrument ? detectedInstrument : instrumentManual
+
+grpAcc1 = "Account 1"
+a1On = input.bool(true, "Enabled", group=grpAcc1)
+a1Name = input.string("Account 1", "Name", group=grpAcc1)
+a1Bal = input.float(10000, "Balance ($)", minval=1, group=grpAcc1)
+a1Risk = input.float(1.0, "Risk (%)", minval=0.1, step=0.1, group=grpAcc1)
+
+grpAcc2 = "Account 2"
+a2On = input.bool(false, "Enabled", group=grpAcc2)
+a2Name = input.string("Account 2", "Name", group=grpAcc2)
+a2Bal = input.float(10000, "Balance ($)", minval=1, group=grpAcc2)
+a2Risk = input.float(1.0, "Risk (%)", minval=0.1, step=0.1, group=grpAcc2)
+
+grpAcc3 = "Account 3"
+a3On = input.bool(false, "Enabled", group=grpAcc3)
+a3Name = input.string("Account 3", "Name", group=grpAcc3)
+a3Bal = input.float(10000, "Balance ($)", minval=1, group=grpAcc3)
+a3Risk = input.float(1.0, "Risk (%)", minval=0.1, step=0.1, group=grpAcc3)
+
+grpAcc4 = "Account 4"
+a4On = input.bool(false, "Enabled", group=grpAcc4)
+a4Name = input.string("Account 4", "Name", group=grpAcc4)
+a4Bal = input.float(10000, "Balance ($)", minval=1, group=grpAcc4)
+a4Risk = input.float(1.0, "Risk (%)", minval=0.1, step=0.1, group=grpAcc4)
+
+grpAcc5 = "Account 5"
+a5On = input.bool(false, "Enabled", group=grpAcc5)
+a5Name = input.string("Account 5", "Name", group=grpAcc5)
+a5Bal = input.float(10000, "Balance ($)", minval=1, group=grpAcc5)
+a5Risk = input.float(1.0, "Risk (%)", minval=0.1, step=0.1, group=grpAcc5)
+
+// ===== SHARED CALCULATION (same trade for every account) =====
+defaultUnitsPerLot = instrument == "XAUUSD" ? 100.0 : 1.0
+unitsPerLot = useCustomContract ? customUnitsPerLot : defaultUnitsPerLot
+unitLabel = instrument == "XAUUSD" ? "oz" : "BTC"
+
+validInputs = entryPrice > 0 and stopLoss > 0 and entryPrice != stopLoss and unitsPerLot > 0
+isLong = validInputs and entryPrice > stopLoss
+
+// Stop distance in $ per unit (e.g. 4000 − 3990 = 10)
+stopDistance = math.abs(entryPrice - stopLoss)
+
+// Risk in $ if we hold 1 full lot when price moves from entry to SL: stopDistance × units per lot
+riskDollarPer1Lot = stopDistance * unitsPerLot
+
+// TP profit ratio: profit = risk × (TP distance / SL distance). So 1:4.15 R:R → profit = risk × 4.15.
+tpDistance = showTP ? math.abs(takeProfit - entryPrice) : 0.0
+rrRatio = stopDistance > 0 ? tpDistance / stopDistance : 0.0
+
+// ===== RESULTS TABLE (bottom right) – trade info + one row per account =====
+var table resultTable = table.new(position.bottom_right, 6, 8,
+     bgcolor=color.new(color.black, 5), border_width=2,
+     border_color=color.new(color.gray, 20))
+
+if barstate.islast and not validInputs
+    table.cell(resultTable, 0, 0, "Fix inputs:", text_color=color.orange, text_size=size.large)
+    table.cell(resultTable, 1, 0, "Entry ≠ SL, both > 0", text_color=color.orange, text_size=size.large)
+
+if barstate.islast and validInputs
+    accNames = array.new_string()
+    accBals = array.new_float()
+    accRisks = array.new_float()
+
+    if a1On
+        array.push(accNames, a1Name)
+        array.push(accBals, a1Bal)
+        array.push(accRisks, a1Risk)
+    if a2On
+        array.push(accNames, a2Name)
+        array.push(accBals, a2Bal)
+        array.push(accRisks, a2Risk)
+    if a3On
+        array.push(accNames, a3Name)
+        array.push(accBals, a3Bal)
+        array.push(accRisks, a3Risk)
+    if a4On
+        array.push(accNames, a4Name)
+        array.push(accBals, a4Bal)
+        array.push(accRisks, a4Risk)
+    if a5On
+        array.push(accNames, a5Name)
+        array.push(accBals, a5Bal)
+        array.push(accRisks, a5Risk)
+
+    // ----- trade info (rows 0-1, cols 0-1) -----
+    table.cell(resultTable, 0, 0, "Instrument", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 0, instrument, text_color=color.white, text_size=size.large)
+
+    table.cell(resultTable, 0, 1, "Direction", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 1, isLong ? "LONG" : "SHORT",
+         text_color=isLong ? color.green : color.red, text_size=size.large)
+
+    // ----- accounts header (row 2, cols 0-6) -----
+    hdrBg = color.new(color.gray, 70)
+    table.cell(resultTable, 0, 2, "Account", text_color=color.gray, text_size=size.normal, bgcolor=hdrBg)
+    table.cell(resultTable, 1, 2, "Balance", text_color=color.gray, text_size=size.normal, bgcolor=hdrBg)
+    table.cell(resultTable, 2, 2, "Risk %", text_color=color.gray, text_size=size.normal, bgcolor=hdrBg)
+    table.cell(resultTable, 3, 2, "Risk $", text_color=color.gray, text_size=size.normal, bgcolor=hdrBg)
+    table.cell(resultTable, 4, 2, "Lot Size", text_color=color.gray, text_size=size.normal, bgcolor=hdrBg)
+    table.cell(resultTable, 5, 2, "Position (" + unitLabel + ")", text_color=color.gray, text_size=size.normal, bgcolor=hdrBg)
+
+    // ----- one row per enabled account (rows 3-7) -----
+    for i = 0 to 4
+        rowIdx = 3 + i
+        if i < array.size(accNames)
+            accBal = array.get(accBals, i)
+            accRiskPct = array.get(accRisks, i)
+            accRiskAmt = accBal * (accRiskPct / 100)
+            accLotRaw = riskDollarPer1Lot > 0 ? accRiskAmt / riskDollarPer1Lot : 0.0
+            accLot = math.round(accLotRaw * 100) / 100
+            accPositionUnits = accLot * unitsPerLot
+
+            table.cell(resultTable, 0, rowIdx, array.get(accNames, i), text_color=color.white, text_size=size.normal)
+            table.cell(resultTable, 1, rowIdx, "$" + str.tostring(accBal, "#,###"), text_color=color.white, text_size=size.normal)
+            table.cell(resultTable, 2, rowIdx, str.tostring(accRiskPct, "0.0") + "%", text_color=color.white, text_size=size.normal)
+            table.cell(resultTable, 3, rowIdx, "$" + str.tostring(accRiskAmt, "#,###"), text_color=color.orange, text_size=size.normal)
+            table.cell(resultTable, 4, rowIdx, str.tostring(accLot, "0.00"), text_color=color.yellow, text_size=size.normal)
+            table.cell(resultTable, 5, rowIdx, str.tostring(accPositionUnits, "0.00"), text_color=color.white, text_size=size.normal)
+
+// ===== TRADE SETUP LINES (entry/BE, SL, TP) – backtest-style, projected forward =====
+var line entryLine = na
+var line stopLine = na
+var line tpLine = na
+var label entryLabel = na
+var label slLabel = na
+var label tpLabel = na
+
+if barstate.islast
+    if not na(entryLine)
+        line.delete(entryLine)
+        entryLine := na
+    if not na(stopLine)
+        line.delete(stopLine)
+        stopLine := na
+    if not na(tpLine)
+        line.delete(tpLine)
+        tpLine := na
+    if not na(entryLabel)
+        label.delete(entryLabel)
+        entryLabel := na
+    if not na(slLabel)
+        label.delete(slLabel)
+        slLabel := na
+    if not na(tpLabel)
+        label.delete(tpLabel)
+        tpLabel := na
+
+    if validInputs
+        labelBar = bar_index + 15
+
+        entryLine := line.new(bar_index, entryPrice, bar_index + 1, entryPrice,
+             extend=extend.right, color=color.new(color.blue, 0), style=line.style_solid, width=2)
+        stopLine := line.new(bar_index, stopLoss, bar_index + 1, stopLoss,
+             extend=extend.right, color=color.new(color.red, 0), style=line.style_dashed, width=2)
+
+        entryLabel := label.new(labelBar, entryPrice, "ENTRY / BE  " + str.tostring(entryPrice, "#,###.##"),
+             xloc=xloc.bar_index, style=label.style_label_left, color=color.blue, textcolor=color.white, size=size.normal)
+        slLabel := label.new(labelBar, stopLoss, "SL  " + str.tostring(stopLoss, "#,###.##") + "  (-" + str.tostring(stopDistance, "#,###.##") + ")",
+             xloc=xloc.bar_index, style=label.style_label_left, color=color.red, textcolor=color.white, size=size.normal)
+
+        if showTP
+            tpLine := line.new(bar_index, takeProfit, bar_index + 1, takeProfit,
+                 extend=extend.right, color=color.new(color.green, 0), style=line.style_dashed, width=2)
+            tpLabel := label.new(labelBar, takeProfit, "TP  " + str.tostring(takeProfit, "#,###.##") + "  (+" + str.tostring(tpDistance, "#,###.##") + ", R " + str.tostring(rrRatio, "0.00") + ")",
+                 xloc=xloc.bar_index, style=label.style_label_left, color=color.green, textcolor=color.white, size=size.normal)

@@ -1,0 +1,123 @@
+//@version=5
+strategy("BOS + S/R Retest Strategy", overlay=true, initial_capital=10000,
+     commission_type=strategy.commission.percent, commission_value=0.02, slippage=1,
+     max_bars_back=2000)
+
+// Structure: track the most recent confirmed swing high/low as the active key level.
+// A close beyond that level = Break of Structure (BOS). The broken level then becomes
+// the retest zone; an entry only fires if price returns to it AND gets confirmation.
+
+// ===== STRUCTURE =====
+grpStructure = "Structure"
+swingLen = input.int(5, "Swing lookback (bars each side)", minval=1, group=grpStructure, tooltip="Bars required on each side of a high/low to confirm it as a swing point.")
+atrLen = input.int(14, "ATR length", minval=1, group=grpStructure, tooltip="Used to scale the retest zone and stop buffer to current volatility, so the same settings work on both XAUUSD and BTC.")
+retestZoneATR = input.float(0.25, "Retest zone size (× ATR)", minval=0.01, step=0.05, group=grpStructure, tooltip="How close price must return to the broken level to count as a retest.")
+slBufferATR = input.float(0.15, "SL buffer beyond swing (× ATR)", minval=0.0, step=0.05, group=grpStructure)
+maxWaitBars = input.int(50, "Max bars to wait for retest+confirmation", minval=1, group=grpStructure, tooltip="A pending setup is cancelled if no confirmed entry happens within this many bars of the BOS.")
+
+// ===== ENTRY CONFIRMATION =====
+grpConfirm = "Entry Confirmation"
+engulfTF = input.string("60", "Engulfing candle timeframe", options=["30", "60"], group=grpConfirm, tooltip="Timeframe the engulfing candle confirmation is read from.")
+bosTF = input.string("15", "Alt. BOS confirmation timeframe", group=grpConfirm, tooltip="Timeframe for the alternate 'fresh BOS' confirmation trigger.")
+bosLookback = input.int(10, "BOS confirmation lookback (bars)", minval=2, group=grpConfirm, tooltip="On the BOS confirmation timeframe, a close breaking the highest/lowest of the prior N bars counts as a fresh BOS.")
+
+// ===== RISK / TARGETS =====
+grpRisk = "Risk / Targets"
+riskPercent = input.float(1.0, "Risk per trade (% of equity)", minval=0.1, step=0.1, group=grpRisk)
+rrMultiple = input.float(2.0, "Take profit (R multiple)", minval=0.1, step=0.1, group=grpRisk)
+allowLong = input.bool(true, "Allow Longs", group=grpRisk)
+allowShort = input.bool(true, "Allow Shorts", group=grpRisk)
+
+// ===== SWING / STRUCTURE DETECTION (chart's own timeframe) =====
+atrVal = ta.atr(atrLen)
+pivotHigh = ta.pivothigh(swingLen, swingLen)
+pivotLow = ta.pivotlow(swingLen, swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+if not na(pivotLow)
+    lastSwingLow := pivotLow
+
+bullishBOS = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
+bearishBOS = not na(lastSwingLow) and ta.crossunder(close, lastSwingLow)
+
+// ===== ENTRY CONFIRMATION SIGNALS =====
+[htfOpen, htfClose, htfOpen1, htfClose1] = request.security(syminfo.tickerid, engulfTF, [open, close, open[1], close[1]], lookahead=barmerge.lookahead_off)
+bullishEngulf = htfClose1 < htfOpen1 and htfClose > htfOpen and htfClose >= htfOpen1 and htfOpen <= htfClose1
+bearishEngulf = htfClose1 > htfOpen1 and htfClose < htfOpen and htfClose <= htfOpen1 and htfOpen >= htfClose1
+
+bosConfirmUp = request.security(syminfo.tickerid, bosTF, ta.crossover(close, ta.highest(high[1], bosLookback)), lookahead=barmerge.lookahead_off)
+bosConfirmDown = request.security(syminfo.tickerid, bosTF, ta.crossunder(close, ta.lowest(low[1], bosLookback)), lookahead=barmerge.lookahead_off)
+
+longConfirm = bullishEngulf or bosConfirmUp
+shortConfirm = bearishEngulf or bosConfirmDown
+
+// ===== SETUP STATE MACHINE =====
+var string bosDirection = na       // "up" or "down" while a setup is pending retest
+var float activeKeyLevel = na      // broken swing level being retested
+var float invalidationLevel = na   // structure failure point (pre-BOS swing on the other side)
+var float pullbackExtreme = na     // extreme reached during the pullback, used for the SL
+var bool waitingForRetest = false
+var int barsSinceBOS = 0
+
+if bullishBOS
+    bosDirection := "up"
+    activeKeyLevel := lastSwingHigh
+    invalidationLevel := lastSwingLow
+    pullbackExtreme := low
+    waitingForRetest := true
+    barsSinceBOS := 0
+else if bearishBOS
+    bosDirection := "down"
+    activeKeyLevel := lastSwingLow
+    invalidationLevel := lastSwingHigh
+    pullbackExtreme := high
+    waitingForRetest := true
+    barsSinceBOS := 0
+else if waitingForRetest
+    barsSinceBOS += 1
+    if bosDirection == "up"
+        pullbackExtreme := na(pullbackExtreme) ? low : math.min(pullbackExtreme, low)
+        if (not na(invalidationLevel) and close < invalidationLevel) or barsSinceBOS > maxWaitBars
+            waitingForRetest := false
+    else
+        pullbackExtreme := na(pullbackExtreme) ? high : math.max(pullbackExtreme, high)
+        if (not na(invalidationLevel) and close > invalidationLevel) or barsSinceBOS > maxWaitBars
+            waitingForRetest := false
+
+inRetestZoneLong = waitingForRetest and bosDirection == "up" and not na(activeKeyLevel) and low <= activeKeyLevel + retestZoneATR * atrVal
+inRetestZoneShort = waitingForRetest and bosDirection == "down" and not na(activeKeyLevel) and high >= activeKeyLevel - retestZoneATR * atrVal
+
+longSetupReady = inRetestZoneLong and longConfirm and allowLong
+shortSetupReady = inRetestZoneShort and shortConfirm and allowShort
+
+// ===== ENTRIES =====
+if longSetupReady
+    slPrice = pullbackExtreme - slBufferATR * atrVal
+    riskPerUnit = close - slPrice
+    if riskPerUnit > 0
+        riskDollars = strategy.equity * (riskPercent / 100)
+        qty = riskDollars / riskPerUnit
+        tpPrice = close + riskPerUnit * rrMultiple
+        strategy.entry("Long", strategy.long, qty=qty)
+        strategy.exit("Long Exit", from_entry="Long", stop=slPrice, limit=tpPrice)
+        waitingForRetest := false
+
+if shortSetupReady
+    slPrice = pullbackExtreme + slBufferATR * atrVal
+    riskPerUnit = slPrice - close
+    if riskPerUnit > 0
+        riskDollars = strategy.equity * (riskPercent / 100)
+        qty = riskDollars / riskPerUnit
+        tpPrice = close - riskPerUnit * rrMultiple
+        strategy.entry("Short", strategy.short, qty=qty)
+        strategy.exit("Short Exit", from_entry="Short", stop=slPrice, limit=tpPrice)
+        waitingForRetest := false
+
+// ===== VISUALS =====
+plot(waitingForRetest ? activeKeyLevel : na, "Active Key Level", color=color.orange, style=plot.style_linebr, linewidth=2)
+plotshape(bullishBOS, "Bullish BOS", shape.triangleup, location.belowbar, color=color.blue, size=size.tiny)
+plotshape(bearishBOS, "Bearish BOS", shape.triangledown, location.abovebar, color=color.red, size=size.tiny)
+bgcolor(waitingForRetest ? (bosDirection == "up" ? color.new(color.blue, 92) : color.new(color.red, 92)) : na)

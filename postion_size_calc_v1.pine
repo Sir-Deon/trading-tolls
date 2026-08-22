@@ -1,0 +1,107 @@
+//@version=5
+indicator("🥇 XAUUSD Lot Size Calculator", overlay=true, max_lines_count=500, max_polylines_count=50)
+
+// XAUUSD: 1 standard lot = 100 oz. $1 price move = $100 P&L per 1 lot (100 oz × $1).
+// Formula: Risk $ = |Entry − SL| × (oz per lot) × lotSize  →  lotSize = Risk $ ÷ (|Entry−SL| × oz per lot)
+
+// ===== INPUTS =====
+grpLevels = "Entry / SL / TP"
+entryPrice = input.float(2650.0, "Entry Price", minval=0.01, step=0.01, group=grpLevels, tooltip="Your planned entry price (e.g. 2650.50)")
+stopLoss = input.float(2640.0, "Stop Loss", minval=0.01, step=0.01, group=grpLevels, tooltip="Stop loss price. Long: SL below entry. Short: SL above entry.")
+takeProfit = input.float(0.0, "Take Profit (0 = off)", minval=0.0, step=0.01, group=grpLevels, tooltip="Take profit price. Use 0 to hide TP.")
+
+grpRisk = "Risk"
+accountBalance = input.float(10000, "Account Balance ($)", minval=1, group=grpRisk)
+riskPercent = input.float(1.0, "Risk Per Trade (%)", step=0.1, minval=0.1, group=grpRisk)
+ozPerLot = input.float(100.0, "Oz per 1 lot (contract size)", minval=0.1, step=1.0, group=grpRisk, tooltip="Usually 100. Set to your broker's contract size (oz per 1 standard lot).")
+
+// ===== LOT SIZE CALCULATION (XAUUSD) =====
+validInputs = entryPrice > 0 and stopLoss > 0 and entryPrice != stopLoss
+isLong = validInputs and entryPrice > stopLoss
+
+// Stop distance in $ per oz (e.g. 2650 − 2640 = 10)
+stopDistance = math.abs(entryPrice - stopLoss)
+
+// Risk in $ if we hold 1 full lot when price moves from entry to SL: stopDistance × oz per lot
+riskDollarPer1Lot = stopDistance * ozPerLot
+
+// How much $ we're willing to lose on this trade
+riskAmount = accountBalance * (riskPercent / 100)
+
+// Lot size so that (stopDistance × ozPerLot × lotSize) = riskAmount
+lotSizeRaw = validInputs and riskDollarPer1Lot > 0 ? riskAmount / riskDollarPer1Lot : 0.0
+lotSize = math.round(lotSizeRaw * 100) / 100
+positionOz = lotSize * ozPerLot
+
+// TP profit: profit = risk × (TP distance / SL distance). So 1:4.15 R:R → profit = risk × 4.15.
+tpDistance = takeProfit > 0 ? math.abs(takeProfit - entryPrice) : 0.0
+rrRatio = stopDistance > 0 ? tpDistance / stopDistance : 0.0
+potentialProfitDollars = takeProfit > 0 and stopDistance > 0 ? math.round(riskAmount * rrRatio * 100) / 100 : 0.0
+
+// ===== RESULTS TABLE (bottom right) – large, readable =====
+var table resultTable = table.new(position.bottom_right, 2, 9, 
+     bgcolor=color.new(color.black, 5), border_width=2, 
+     border_color=color.new(color.gray, 20))
+
+if barstate.islast and validInputs
+    table.cell(resultTable, 0, 0, "Account", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 0, "$" + str.tostring(accountBalance, "#,###"), 
+         text_color=color.white, text_size=size.large)
+    
+    table.cell(resultTable, 0, 1, "XAUUSD", 
+         text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 1, isLong ? "LONG" : "SHORT", 
+         text_color=isLong ? color.green : color.red, text_size=size.large)
+    
+    table.cell(resultTable, 0, 2, "Lot size", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 2, str.tostring(lotSize, "0.00"), 
+         text_color=color.white, text_size=size.huge)
+    
+    table.cell(resultTable, 0, 3, "Position (oz)", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 3, str.tostring(positionOz, "0.00"), 
+         text_color=color.white, text_size=size.large)
+    
+    table.cell(resultTable, 0, 4, "Entry", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 4, str.tostring(entryPrice, "#,###.##"), 
+         text_color=color.white, text_size=size.large)
+    
+    table.cell(resultTable, 0, 5, "Stop Loss", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 5, str.tostring(stopLoss, "#,###.##"), 
+         text_color=color.red, text_size=size.large)
+    
+    table.cell(resultTable, 0, 6, "Risk (Loss)", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 6, "$" + str.tostring(riskAmount, "#,###"), 
+         text_color=color.orange, text_size=size.large)
+    
+    table.cell(resultTable, 0, 7, "R:R", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 7, takeProfit > 0 ? str.tostring(rrRatio, "0.00") : "—", 
+         text_color=color.gray, text_size=size.large)
+    
+    table.cell(resultTable, 0, 8, "TP Profit", text_color=color.gray, text_size=size.large)
+    table.cell(resultTable, 1, 8, takeProfit > 0 ? "$" + str.tostring(potentialProfitDollars, "#,###") : "—", 
+         text_color=color.green, text_size=size.large)
+
+// ===== HORIZONTAL LINES (entry, SL, TP) – full chart width =====
+var line entryLine = na
+var line stopLine = na
+var line tpLine = na
+
+if barstate.islast
+    if not na(entryLine)
+        line.delete(entryLine)
+        entryLine := na
+    if not na(stopLine)
+        line.delete(stopLine)
+        stopLine := na
+    if not na(tpLine)
+        line.delete(tpLine)
+        tpLine := na
+
+    if validInputs
+        entryLine := line.new(bar_index, entryPrice, bar_index + 1, entryPrice, color=color.blue, width=3)
+        line.set_extend(entryLine, extend.both)
+        stopLine := line.new(bar_index, stopLoss, bar_index + 1, stopLoss, color=color.red, width=3)
+        line.set_extend(stopLine, extend.both)
+        if takeProfit > 0
+            tpLine := line.new(bar_index, takeProfit, bar_index + 1, takeProfit, color=color.green, width=3)
+            line.set_extend(tpLine, extend.both)
