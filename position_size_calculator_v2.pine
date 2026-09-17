@@ -1,8 +1,10 @@
 //@version=5
-indicator("🥇 Multi-Account Position Size Calculator (XAUUSD / BTC)", overlay=true, max_lines_count=500, max_labels_count=500, max_polylines_count=50)
+indicator("🥇 Multi-Account Position Size Calculator (XAUUSD / BTC / GBPJPY / GBPUSD)", overlay=true, max_lines_count=500, max_labels_count=500, max_polylines_count=50)
 
 // XAUUSD: 1 standard lot = 100 oz. $1 price move = $100 P&L per 1 lot (100 oz × $1).
 // BTCUSD: 1 standard lot = 1 BTC (most brokers). $1 price move = $1 P&L per 1 lot (1 BTC × $1).
+// GBPJPY: 1 standard lot = 100,000 GBP. P&L is in JPY, so it's converted to USD via USDJPY.
+// GBPUSD: 1 standard lot = 100,000 GBP. Already quoted in USD, so no FX conversion needed.
 // Formula: Risk $ = |Entry − SL| × (units per lot) × lotSize  →  lotSize = Risk $ ÷ (|Entry−SL| × units per lot)
 // Each registered account has its own balance and risk %, but shares the same Entry/SL/TP.
 
@@ -14,18 +16,24 @@ showTP = input.bool(true, "Show Take Profit", group=grpLevels, tooltip="Toggle t
 takeProfit = input.price(4020.0, "Take Profit", group=grpLevels, tooltip="Drag this line directly on the chart, or type a price here.")
 
 grpInstrument = "Instrument"
-autoDetectInstrument = input.bool(true, "Auto-detect from chart symbol", group=grpInstrument, tooltip="Reads the chart's symbol to pick XAUUSD or BTCUSD automatically. Turn off to choose manually.")
-instrumentManual = input.string("XAUUSD", "Instrument (manual)", options=["XAUUSD", "BTCUSD"], group=grpInstrument, tooltip="Used only when auto-detect is off, or when the chart symbol isn't recognized.")
+autoDetectInstrument = input.bool(true, "Auto-detect from chart symbol", group=grpInstrument, tooltip="Reads the chart's symbol to pick XAUUSD, BTCUSD, GBPJPY, or GBPUSD automatically. Turn off to choose manually.")
+instrumentManual = input.string("XAUUSD", "Instrument (manual)", options=["XAUUSD", "BTCUSD", "GBPJPY", "GBPUSD"], group=grpInstrument, tooltip="Used only when auto-detect is off, or when the chart symbol isn't recognized.")
 useCustomContract = input.bool(false, "Custom contract size", group=grpInstrument, tooltip="Enable to override the default contract size below (e.g. your broker uses different lot specs).")
 customUnitsPerLot = input.float(100.0, "Custom units per lot", minval=0.0001, step=1.0, group=grpInstrument, tooltip="Only used when 'Custom contract size' is enabled.")
 
-// Detect instrument from the chart's symbol (ticker/basecurrency), e.g. OANDA:XAUUSD, COINBASE:BTCUSD, BTCUSDT.
+// Detect instrument from the chart's symbol (ticker/basecurrency), e.g. OANDA:XAUUSD, COINBASE:BTCUSD, BTCUSDT, GBPJPY, GBPUSD.
 tickerUpper = str.upper(syminfo.ticker)
 baseUpper = str.upper(syminfo.basecurrency)
 detectedIsBTC = str.contains(tickerUpper, "BTC") or baseUpper == "BTC"
 detectedIsXAU = str.contains(tickerUpper, "XAU") or str.contains(tickerUpper, "GOLD") or baseUpper == "XAU"
-detectedInstrument = detectedIsBTC ? "BTCUSD" : detectedIsXAU ? "XAUUSD" : instrumentManual
+detectedIsGBPJPY = str.contains(tickerUpper, "GBPJPY")
+detectedIsGBPUSD = str.contains(tickerUpper, "GBPUSD")
+detectedInstrument = detectedIsBTC ? "BTCUSD" : detectedIsXAU ? "XAUUSD" : detectedIsGBPJPY ? "GBPJPY" : detectedIsGBPUSD ? "GBPUSD" : instrumentManual
 instrument = autoDetectInstrument ? detectedInstrument : instrumentManual
+
+grpFX = "FX Conversion (JPY-quoted pairs)"
+useCustomFXRate = input.bool(false, "Custom USDJPY rate", group=grpFX, tooltip="GBPJPY P&L is in JPY, so it's converted to USD using USDJPY. Auto-fetched from the chart's data feed by default; enable this to type your own rate instead (e.g. if USDJPY isn't available on your feed).")
+customUsdJpyRate = input.float(150.0, "Custom USDJPY rate", minval=0.0001, group=grpFX)
 
 grpAcc1 = "Account 1"
 a1On = input.bool(true, "Enabled", group=grpAcc1)
@@ -58,18 +66,27 @@ a5Bal = input.float(10000, "Balance ($)", minval=1, group=grpAcc5)
 a5Risk = input.float(1.0, "Risk (%)", minval=0.1, step=0.1, group=grpAcc5)
 
 // ===== SHARED CALCULATION (same trade for every account) =====
-defaultUnitsPerLot = instrument == "XAUUSD" ? 100.0 : 1.0
+isGBPPair = instrument == "GBPJPY" or instrument == "GBPUSD"
+defaultUnitsPerLot = instrument == "XAUUSD" ? 100.0 : isGBPPair ? 100000.0 : 1.0
 unitsPerLot = useCustomContract ? customUnitsPerLot : defaultUnitsPerLot
-unitLabel = instrument == "XAUUSD" ? "oz" : "BTC"
+unitLabel = instrument == "XAUUSD" ? "oz" : isGBPPair ? "GBP" : "BTC"
 
-validInputs = entryPrice > 0 and stopLoss > 0 and entryPrice != stopLoss and unitsPerLot > 0
+// GBPJPY P&L accrues in JPY; convert to USD via USDJPY. Other instruments pass through unchanged (rate = 1).
+autoUsdJpyRate = request.security("USDJPY", timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+usdJpyRate = useCustomFXRate ? customUsdJpyRate : autoUsdJpyRate
+needsFXConversion = instrument == "GBPJPY"
+fxRateValid = not needsFXConversion or (not na(usdJpyRate) and usdJpyRate > 0)
+
+validInputs = entryPrice > 0 and stopLoss > 0 and entryPrice != stopLoss and unitsPerLot > 0 and fxRateValid
 isLong = validInputs and entryPrice > stopLoss
 
-// Stop distance in $ per unit (e.g. 4000 − 3990 = 10)
+// Stop distance in price terms (e.g. 4000 − 3990 = 10)
 stopDistance = math.abs(entryPrice - stopLoss)
 
-// Risk in $ if we hold 1 full lot when price moves from entry to SL: stopDistance × units per lot
-riskDollarPer1Lot = stopDistance * unitsPerLot
+// Risk if we hold 1 full lot when price moves from entry to SL: stopDistance × units per lot
+// (in JPY for GBPJPY, in USD for XAUUSD/BTCUSD) — converted to USD below.
+riskDollarPer1LotRaw = stopDistance * unitsPerLot
+riskDollarPer1Lot = needsFXConversion and fxRateValid ? riskDollarPer1LotRaw / usdJpyRate : riskDollarPer1LotRaw
 
 // TP profit ratio: profit = risk × (TP distance / SL distance). So 1:4.15 R:R → profit = risk × 4.15.
 tpDistance = showTP ? math.abs(takeProfit - entryPrice) : 0.0
@@ -82,7 +99,7 @@ var table resultTable = table.new(position.bottom_right, 6, 8,
 
 if barstate.islast and not validInputs
     table.cell(resultTable, 0, 0, "Fix inputs:", text_color=color.orange, text_size=size.large)
-    table.cell(resultTable, 1, 0, "Entry ≠ SL, both > 0", text_color=color.orange, text_size=size.large)
+    table.cell(resultTable, 1, 0, fxRateValid ? "Entry ≠ SL, both > 0" : "USDJPY rate unavailable — enable Custom USDJPY rate", text_color=color.orange, text_size=size.large)
 
 if barstate.islast and validInputs
     accNames = array.new_string()
